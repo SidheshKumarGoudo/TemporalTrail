@@ -1,0 +1,179 @@
+use std::env;
+use tt_engine::{Engine, NodeRef, Result, MAIN};
+
+fn db_path() -> String {
+    env::var("TT_DB").unwrap_or_else(|_| ".temporaltrail.db".to_string())
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if let Err(e) = run(&args) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run(args: &[String]) -> Result<()> {
+    let cmd = args.get(0).map(|s| s.as_str()).unwrap_or("status");
+    let e = Engine::open(&db_path())?;
+
+    match cmd {
+        "init" => {
+            println!("initialized TemporalTrail repo at {}", db_path());
+            println!("MAIN -> n{}", e.get_timeline(MAIN)?.head_node_id);
+        }
+
+        "status" => {
+            let cur = e.current_timeline_name()?;
+            let cur_tl = e.get_timeline(&cur)?;
+            let main = e.get_timeline(MAIN)?;
+            println!("current timeline: {cur} (HEAD n{})", cur_tl.head_node_id);
+            println!("MAIN HEAD: n{}", main.head_node_id);
+            let node = e.get_node(cur_tl.head_node_id)?;
+            println!("state: {:?}", node.fake_state);
+        }
+
+        "timelines" => {
+            for t in e.list_timelines()? {
+                println!(
+                    "{}{} -> n{}",
+                    if t.is_main { "* " } else { "  " },
+                    t.name,
+                    t.head_node_id
+                );
+            }
+        }
+
+        "checkpoint" => {
+            let state = args.get(1).ok_or_else(|| tt_engine::EngineError(
+                "usage: tl checkpoint <state> [-m <msg>]".into(),
+            ))?;
+            let msg = flag_value(args, "-m");
+            let cur = e.current_timeline_name()?;
+            let node = e.checkpoint(&cur, state, msg.as_deref())?;
+            println!("n{} committed on {cur}", node.id);
+        }
+
+        "fork" => {
+            let new_name = args.get(1).ok_or_else(|| tt_engine::EngineError(
+                "usage: tl fork <new-timeline-name> --from <ref>".into(),
+            ))?;
+            let from = flag_value(args, "--from").unwrap_or_else(|| {
+                // default: fork from current timeline's HEAD
+                e.current_timeline_name().unwrap_or_else(|_| MAIN.to_string())
+            });
+            let source = NodeRef::parse(&from);
+            let tl = e.fork(&source, new_name)?;
+            println!("forked '{}' -> n{} (no new Node created)", tl.name, tl.head_node_id);
+            e.switch(new_name)?;
+            println!("switched to {new_name}");
+        }
+
+        "switch" => {
+            let name = args.get(1).ok_or_else(|| tt_engine::EngineError(
+                "usage: tl switch <timeline-name>".into(),
+            ))?;
+            e.switch(name)?;
+            println!("switched to {name}");
+        }
+
+        "log" => {
+            let tl_name = args.get(1).cloned().unwrap_or(e.current_timeline_name()?);
+            for n in e.log(&tl_name)? {
+                println!(
+                    "n{}  parent={}  {}  {:?}",
+                    n.id,
+                    n.parent_id.map(|p| format!("n{p}")).unwrap_or_else(|| "-".into()),
+                    n.action_desc.unwrap_or_default(),
+                    n.fake_state
+                );
+            }
+        }
+
+        "diff" => {
+            let a = parse_node_id(args.get(1))?;
+            let b = parse_node_id(args.get(2))?;
+            let (na, nb, same) = e.diff(a, b)?;
+            println!("n{}: {:?}", na.id, na.fake_state);
+            println!("n{}: {:?}", nb.id, nb.fake_state);
+            println!("{}", if same { "identical" } else { "differs" });
+        }
+
+        "validate" => {
+            let node_ref = args.get(1).ok_or_else(|| tt_engine::EngineError(
+                "usage: tl validate <node-ref> <PASS|FAIL> [--validator name]".into(),
+            ))?;
+            let status = args.get(2).ok_or_else(|| tt_engine::EngineError(
+                "usage: tl validate <node-ref> <PASS|FAIL> [--validator name]".into(),
+            ))?;
+            let node_id = e.resolve(&NodeRef::parse(node_ref))?;
+            let validator = flag_value(args, "--validator");
+            let v = e.validate(node_id, status, validator.as_deref())?;
+            println!("validation #{} recorded: n{} -> {}", v.id, v.node_id, v.status);
+        }
+
+        "allow" | "deny" => {
+            let target = args.get(1).ok_or_else(|| tt_engine::EngineError(
+                "usage: tl allow|deny <target-host>".into(),
+            ))?;
+            let cur = e.current_timeline_name()?;
+            let head = e.get_timeline(&cur)?.head_node_id;
+            let decision = if cmd == "allow" { "ALLOW" } else { "DENY" };
+            e.log_external_interaction(&cur, head, target, decision)?;
+            println!("{decision} {target} logged on {cur} @ n{head}");
+        }
+
+        "promote" => {
+            let node_ref = args.get(1).ok_or_else(|| tt_engine::EngineError(
+                "usage: tl promote <node-ref> [--confirm-superseding-effects]".into(),
+            ))?;
+            let node_id = e.resolve(&NodeRef::parse(node_ref))?;
+            let confirm = args.iter().any(|a| a == "--confirm-superseding-effects");
+            let r = e.promote(node_id, confirm)?;
+            println!("promotion #{} committed", r.promotion_id);
+            println!("MAIN divergence ancestor: n{}", r.main_divergence_ancestor);
+            println!("MAIN HEAD n{} -> n{}", r.superseded_main_head, r.promoted_node_id);
+            if r.superseding_interactions_confirmed > 0 {
+                println!(
+                    "note: {} superseded external interaction(s) confirmed, not reverted",
+                    r.superseding_interactions_confirmed
+                );
+            }
+        }
+
+        "discard" => {
+            let name = args.get(1).ok_or_else(|| tt_engine::EngineError(
+                "usage: tl discard <timeline-name>".into(),
+            ))?;
+            let r = e.discard(name)?;
+            println!("timeline '{}' discarded.", r.timeline_name);
+            println!("internal state: discarded.");
+            println!("external interactions: {} allowed, {} denied", r.allowed, r.denied);
+            println!("these external effects cannot be automatically reverted.");
+        }
+
+        other => {
+            eprintln!("unknown command: {other}");
+            eprintln!(
+                "commands: init status timelines checkpoint fork switch log diff \
+                 validate allow deny promote discard"
+            );
+            std::process::exit(2);
+        }
+    }
+    Ok(())
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+fn parse_node_id(s: Option<&String>) -> Result<i64> {
+    let s = s.ok_or_else(|| tt_engine::EngineError("missing node id".into()))?;
+    let s = s.strip_prefix('n').unwrap_or(s);
+    s.parse::<i64>()
+        .map_err(|_| tt_engine::EngineError(format!("invalid node id: {s}")))
+}
