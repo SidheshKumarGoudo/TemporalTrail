@@ -1,8 +1,9 @@
 use std::env;
+use std::path::PathBuf;
 use tt_engine::{Engine, NodeRef, Result, MAIN};
 
-fn db_path() -> String {
-    env::var("TT_DB").unwrap_or_else(|_| ".temporaltrail.db".to_string())
+fn tt_home() -> PathBuf {
+    env::var("TT_HOME").unwrap_or_else(|_| ".tt".to_string()).into()
 }
 
 fn main() {
@@ -15,11 +16,12 @@ fn main() {
 
 fn run(args: &[String]) -> Result<()> {
     let cmd = args.get(0).map(|s| s.as_str()).unwrap_or("status");
-    let e = Engine::open(&db_path())?;
+    let home = tt_home();
+    let e = Engine::open(&home)?;
 
     match cmd {
         "init" => {
-            println!("initialized TemporalTrail repo at {}", db_path());
+            println!("initialized TemporalTrail repo at {}", home.display());
             println!("MAIN -> n{}", e.get_timeline(MAIN)?.head_node_id);
         }
 
@@ -44,14 +46,26 @@ fn run(args: &[String]) -> Result<()> {
             }
         }
 
+        "enter" => {
+            let name = args.get(1).cloned().unwrap_or(e.current_timeline_name()?);
+            let merged = e.mount(&name)?;
+            e.switch(&name)?;
+            println!("{name} mounted at: {}", merged.display());
+            println!("cd there and edit real files, then run: tl checkpoint -m \"message\"");
+        }
+
+        "leave" => {
+            let name = args.get(1).cloned().unwrap_or(e.current_timeline_name()?);
+            e.unmount(&name)?;
+            println!("{name} unmounted");
+        }
+
         "checkpoint" => {
-            let state = args.get(1).ok_or_else(|| tt_engine::EngineError(
-                "usage: tl checkpoint <state> [-m <msg>]".into(),
-            ))?;
             let msg = flag_value(args, "-m");
             let cur = e.current_timeline_name()?;
-            let node = e.checkpoint(&cur, state, msg.as_deref())?;
+            let node = e.checkpoint_from_live(&cur, msg.as_deref())?;
             println!("n{} committed on {cur}", node.id);
+            println!("contents: {}", node.fake_state);
         }
 
         "fork" => {
@@ -155,7 +169,7 @@ fn run(args: &[String]) -> Result<()> {
         other => {
             eprintln!("unknown command: {other}");
             eprintln!(
-                "commands: init status timelines checkpoint fork switch log diff \
+                "commands: init status timelines enter leave checkpoint fork switch log diff \
                  validate allow deny promote discard"
             );
             std::process::exit(2);

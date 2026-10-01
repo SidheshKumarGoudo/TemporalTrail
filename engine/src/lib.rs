@@ -14,6 +14,9 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAIN: &str = "main";
@@ -43,6 +46,25 @@ fn now() -> i64 {
 
 fn err(msg: impl Into<String>) -> EngineError {
     EngineError(msg.into())
+}
+
+/// Short, human-readable description of a directory's top-level contents,
+/// for `tl log` display only — never used for any correctness decision.
+fn summarize_dir(dir: &Path) -> String {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    if names.is_empty() {
+        "(no changes)".to_string()
+    } else {
+        names.join(", ")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,18 +130,36 @@ impl<'a> NodeRef<'a> {
 
 pub struct Engine {
     conn: Connection,
+    /// Phase 2: root of this repo's managed sandbox — holds db.sqlite3,
+    /// layers/ (one permanent, sealed directory per Node, keyed purely by
+    /// node id — §17's "no column stores a derived path" principle applied
+    /// to the filesystem too: nothing in SQLite points at these, the path
+    /// is always computed as tt_home/layers/n<id>), and live/ (one
+    /// upper+work+merged set per Timeline, for state not yet checkpointed).
+    tt_home: PathBuf,
 }
 
 impl Engine {
-    /// Opens (or creates) the engine's SQLite store at `path` and ensures
-    /// MAIN exists with a root Node. §14: this Connection is used
-    /// single-threaded, single-writer, by design — every mutating method
-    /// wraps its work in one transaction, satisfying V0's single-writer
-    /// invariant without needing external locking.
-    pub fn open(path: &str) -> Result<Engine> {
-        let conn = Connection::open(path)?;
+    /// Opens (or creates) the engine's store rooted at `tt_home` — a
+    /// dedicated sandbox directory this tool fully owns (per the decision
+    /// to manage a tool-owned sandbox rather than wrap an arbitrary
+    /// existing project directory) — and ensures MAIN exists with a root
+    /// Node. §14: this Connection is used single-threaded, single-writer,
+    /// by design — every mutating method wraps its work in one
+    /// transaction, satisfying V0's single-writer invariant without
+    /// needing external locking.
+    pub fn open(tt_home: &Path) -> Result<Engine> {
+        fs::create_dir_all(tt_home.join("layers"))
+            .map_err(|e| err(format!("cannot create {}: {e}", tt_home.display())))?;
+        fs::create_dir_all(tt_home.join("live"))
+            .map_err(|e| err(format!("cannot create {}: {e}", tt_home.display())))?;
+        let db_path = tt_home.join("db.sqlite3");
+        let conn = Connection::open(&db_path)?;
         conn.execute_batch(SCHEMA)?;
-        let e = Engine { conn };
+        let e = Engine {
+            conn,
+            tt_home: tt_home.to_path_buf(),
+        };
         e.bootstrap()?;
         Ok(e)
     }
@@ -140,6 +180,10 @@ impl Engine {
                 params![MAIN, now()],
             )?;
             let root_id = self.conn.last_insert_rowid();
+            // Root Node's layer is an empty, real directory — the bottom
+            // of every lowerdir stack.
+            fs::create_dir_all(self.layer_dir(root_id))
+                .map_err(|e| err(format!("cannot create root layer dir: {e}")))?;
             self.conn.execute(
                 "INSERT INTO timeline (name, head_node_id, is_main, created_at) VALUES (?1, ?2, 1, ?3)",
                 params![MAIN, root_id, now()],
@@ -150,6 +194,144 @@ impl Engine {
             )?;
         }
         Ok(())
+    }
+
+    // ---- Phase 2: OS state domain — real directories, OverlayFS --------
+
+    /// The sealed, permanent, read-only (by convention — nothing re-opens
+    /// it for writing after checkpoint) directory for a Node's own
+    /// filesystem delta. Purely derived from node_id; never stored in SQL.
+    fn layer_dir(&self, node_id: i64) -> PathBuf {
+        self.tt_home.join("layers").join(format!("n{node_id}"))
+    }
+
+    fn live_dir(&self, timeline_name: &str) -> PathBuf {
+        self.tt_home.join("live").join(timeline_name)
+    }
+
+    /// (upper, work, merged) paths for a Timeline's not-yet-checkpointed
+    /// live state. Created on first use.
+    fn live_paths(&self, timeline_name: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
+        let base = self.live_dir(timeline_name);
+        let upper = base.join("upper");
+        let work = base.join("work");
+        let merged = base.join("merged");
+        for p in [&upper, &work, &merged] {
+            fs::create_dir_all(p).map_err(|e| err(format!("cannot create {}: {e}", p.display())))?;
+        }
+        Ok((upper, work, merged))
+    }
+
+    fn is_mounted(&self, merged: &Path) -> bool {
+        Command::new("mountpoint")
+            .arg("-q")
+            .arg(merged)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Ordered lowerdir list for `timeline`'s current HEAD: nearest
+    /// ancestor first, root last — reuses `log()`, which already walks
+    /// parent_id in exactly this order (head → root).
+    fn lowerdir_chain(&self, timeline_name: &str) -> Result<String> {
+        let nodes = self.log(timeline_name)?;
+        let dirs: Vec<String> = nodes
+            .iter()
+            .map(|n| self.layer_dir(n.id).to_string_lossy().into_owned())
+            .collect();
+        Ok(dirs.join(":"))
+    }
+
+    /// Mounts timeline's merged view (ancestor layers + its own live
+    /// upper) at a real, globally-visible path. Uses `sudo mount` rather
+    /// than an unprivileged `unshare` mount namespace so the result is
+    /// visible to VS Code / a second terminal, not just one subprocess —
+    /// see the design note on this trade-off. Returns the merged path.
+    pub fn mount(&self, timeline_name: &str) -> Result<PathBuf> {
+        self.get_timeline(timeline_name)?; // must exist
+        let (upper, work, merged) = self.live_paths(timeline_name)?;
+        if self.is_mounted(&merged) {
+            return Ok(merged); // already mounted — no-op, idempotent
+        }
+        let lowerdir = self.lowerdir_chain(timeline_name)?;
+        let opts = format!(
+            "lowerdir={lowerdir},upperdir={},workdir={}",
+            upper.display(),
+            work.display()
+        );
+        let status = Command::new("sudo")
+            .args(["mount", "-t", "overlay", "overlay", "-o", &opts])
+            .arg(&merged)
+            .status()
+            .map_err(|e| err(format!("failed to run sudo mount: {e}")))?;
+        if !status.success() {
+            return Err(err("sudo mount failed (see output above)"));
+        }
+        Ok(merged)
+    }
+
+    pub fn unmount(&self, timeline_name: &str) -> Result<()> {
+        let merged = self.live_dir(timeline_name).join("merged");
+        if !self.is_mounted(&merged) {
+            return Ok(()); // already unmounted — no-op
+        }
+        let status = Command::new("sudo")
+            .args(["umount", &merged.to_string_lossy()])
+            .status()
+            .map_err(|e| err(format!("failed to run sudo umount: {e}")))?;
+        if !status.success() {
+            return Err(err("sudo umount failed (see output above)"));
+        }
+        Ok(())
+    }
+
+    /// §7/§8: seals whatever is currently in `timeline`'s live upperdir
+    /// into a brand-new, permanent Node layer — the real-domain version
+    /// of Phase 1's `checkpoint`. If the timeline is currently mounted,
+    /// it's unmounted first (so no process has the upperdir open while we
+    /// rename it out from under it), sealed, then remounted fresh with an
+    /// empty upper, ready for more live edits — matching §8's atomicity
+    /// requirement (freeze → capture → commit) for this one domain.
+    pub fn checkpoint_from_live(&self, timeline_name: &str, action_desc: Option<&str>) -> Result<Node> {
+        let tl = self.get_timeline(timeline_name)?;
+        let (upper, _work, merged) = self.live_paths(timeline_name)?;
+        let was_mounted = self.is_mounted(&merged);
+        if was_mounted {
+            self.unmount(timeline_name)?;
+        }
+
+        // Summarize what changed, for human-readable `tl log` output only
+        // — the authoritative state is the real layer directory, not this
+        // string (fake_state is repurposed here as a display-only summary,
+        // same column, no schema change).
+        let summary = summarize_dir(&upper);
+
+        self.conn.execute(
+            "INSERT INTO node (parent_id, timeline_name, timestamp, action_desc, fake_state)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![tl.head_node_id, timeline_name, now(), action_desc, summary],
+        )?;
+        let new_id = self.conn.last_insert_rowid();
+
+        // Seal: the live upperdir itself BECOMES the new Node's permanent
+        // layer (a rename, not a copy — zero-cost, and there is now
+        // nothing left in `upper` for anyone to confuse with live state).
+        let sealed = self.layer_dir(new_id);
+        fs::rename(&upper, &sealed)
+            .map_err(|e| err(format!("failed to seal layer for n{new_id}: {e}")))?;
+        fs::create_dir_all(&upper) // fresh, empty upper for continued live work
+            .map_err(|e| err(format!("failed to recreate live upperdir: {e}")))?;
+
+        self.conn.execute(
+            "UPDATE timeline SET head_node_id = ?1 WHERE name = ?2",
+            params![new_id, timeline_name],
+        )?;
+
+        if was_mounted {
+            self.mount(timeline_name)?;
+        }
+        self.get_node(new_id)
     }
 
     // ---- lookups -------------------------------------------------------
@@ -453,6 +635,17 @@ impl Engine {
             params![node_id, MAIN],
         )?;
 
+        // If MAIN is currently mounted, its merged view was built from the
+        // OLD lowerdir chain and will keep showing stale content until
+        // remounted — refresh it now so "the outside world observes the
+        // promoted state" (§11) is actually true the moment this returns,
+        // not just true in the database.
+        let (_upper, _work, main_merged) = self.live_paths(MAIN)?;
+        if self.is_mounted(&main_merged) {
+            self.unmount(MAIN)?;
+            self.mount(MAIN)?;
+        }
+
         Ok(PromotionResult {
             promotion_id,
             promoted_node_id: node_id,
@@ -479,6 +672,18 @@ impl Engine {
             params![timeline_name],
             |r| r.get(0),
         )?;
+        // Phase 2: tear down the live mount/upperdir — this is the
+        // internal-resource teardown §13 requires. Sealed layer
+        // directories (past checkpoints) are NOT touched; only the
+        // not-yet-checkpointed live state is discarded, which is correct
+        // since every sealed layer already belongs permanently to its
+        // Node, independent of this Timeline's existence.
+        let merged = self.live_dir(timeline_name).join("merged");
+        if self.is_mounted(&merged) {
+            self.unmount(timeline_name)?;
+        }
+        let _ = fs::remove_dir_all(self.live_dir(timeline_name)); // best-effort
+
         // Node history is deliberately NOT deleted — it remains as
         // orphaned, unreachable-by-HEAD lineage in the DAG (§13).
         self.conn.execute("DELETE FROM timeline WHERE name = ?1", params![timeline_name])?;
