@@ -11,6 +11,7 @@
 //! MAIN divergence ancestor via LCA with no stored ancestor field (§11),
 //! and discard never touches Node history (§13).
 
+pub mod gateway;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::fmt;
