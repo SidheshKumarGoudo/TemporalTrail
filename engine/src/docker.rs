@@ -1,5 +1,5 @@
 //! Docker state domain: ownership of containers and volumes by label, and
-//! capture of their state for checkpoints.
+//! capture and restore of their state for checkpoints.
 //!
 //! This module talks to Docker only through its command-line client, and only
 //! ever acts on resources that carry TemporalTrail's ownership labels, so it
@@ -24,6 +24,7 @@ const LISTING_FIELD_SEPARATOR: char = '\t';
 const LISTING_FIELD_COUNT: usize = 5;
 const MAX_TIMELINE_NAME_LENGTH: usize = 32;
 const MAX_RESOURCE_NAME_LENGTH: usize = 64;
+const SHA256_HEX_LENGTH: usize = 64;
 const VOLUME_ARCHIVE_EXTENSION: &str = "tar";
 const ARCHIVE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -31,7 +32,9 @@ const ARCHIVE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 pub enum DockerError {
     InvalidTimelineName(String),
     InvalidResourceName(String),
+    InvalidContentHash(String),
     NotManaged(String),
+    AlreadyExists(String),
     CommandFailed(String),
 }
 
@@ -40,10 +43,16 @@ impl fmt::Display for DockerError {
         match self {
             DockerError::InvalidTimelineName(name) => write!(f, "invalid timeline name: {name}"),
             DockerError::InvalidResourceName(name) => write!(f, "invalid container, volume or tag name: {name}"),
+            DockerError::InvalidContentHash(hash) => {
+                write!(f, "invalid content hash (expected 64 lowercase hex characters): {hash}")
+            }
             DockerError::NotManaged(name) => write!(
                 f,
                 "'{name}' is not managed by TemporalTrail (it has no {LABEL_MANAGED} label)"
             ),
+            DockerError::AlreadyExists(name) => {
+                write!(f, "volume '{name}' already exists; refusing to overwrite it")
+            }
             DockerError::CommandFailed(message) => write!(f, "{message}"),
         }
     }
@@ -82,6 +91,14 @@ pub struct VolumeCapture {
     pub size_bytes: u64,
     /// True when an identical archive was already in the store, so nothing new was written.
     pub already_stored: bool,
+}
+
+/// The result of restoring an archive into a new volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredVolume {
+    pub volume_name: String,
+    pub timeline: String,
+    pub content_hash: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +160,20 @@ fn validate_snapshot_tag(tag: &str) -> Result<(), DockerError> {
         Ok(())
     } else {
         Err(DockerError::InvalidResourceName(tag.to_string()))
+    }
+}
+
+/// Content hashes become file names, so they must be exactly 64 lowercase hex
+/// characters; this also rules out any path tricks.
+fn validate_content_hash(hash: &str) -> Result<(), DockerError> {
+    let is_valid = hash.len() == SHA256_HEX_LENGTH
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+    if is_valid {
+        Ok(())
+    } else {
+        Err(DockerError::InvalidContentHash(hash.to_string()))
     }
 }
 
@@ -293,6 +324,10 @@ fn is_volume_managed(volume_name: &str) -> Result<bool, DockerError> {
     Ok(label_value.trim() == "true")
 }
 
+fn volume_exists(volume_name: &str) -> bool {
+    run_docker(["volume", "inspect", volume_name]).is_ok()
+}
+
 fn volume_mountpoint(volume_name: &str) -> Result<String, DockerError> {
     let mountpoint = run_docker(["volume", "inspect", "--format", "{{.Mountpoint}}", volume_name])?;
     let mountpoint = mountpoint.trim().to_string();
@@ -390,6 +425,101 @@ pub fn capture_volume(volume_name: &str, archive_store: &Path) -> Result<VolumeC
     })
 }
 
+// ---------------------------------------------------------------------------
+// Restoring a volume
+// ---------------------------------------------------------------------------
+
+/// SHA-256 of a file's contents, in lowercase hex.
+fn hash_file(path: &Path) -> Result<String, DockerError> {
+    let mut file = fs::File::open(path).map_err(io_failure("could not open archive"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; ARCHIVE_COPY_BUFFER_BYTES];
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(io_failure("could not read archive"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Unpacks a tar archive into `directory`, keeping numeric owners and permissions.
+fn extract_archive_into(directory: &str, archive_path: &Path) -> Result<(), DockerError> {
+    let output = Command::new("sudo")
+        .args(["tar", "--numeric-owner", "-C", directory, "-xf"])
+        .arg(archive_path)
+        .output()
+        .map_err(|error| DockerError::CommandFailed(format!("could not run tar: {error}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(DockerError::CommandFailed(format!(
+            "tar failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
+/// Creates a new volume for `timeline` and fills it from a stored archive.
+///
+/// Everything is checked before anything is created: the archive must exist and
+/// still match its hash, and the target volume name must be free. If unpacking
+/// fails, the half-built volume is removed again. The new volume is labeled
+/// with `timeline`, not with the timeline the archive was captured from.
+pub fn restore_volume(
+    content_hash: &str,
+    archive_store: &Path,
+    timeline: &str,
+    volume_name: &str,
+) -> Result<RestoredVolume, DockerError> {
+    validate_content_hash(content_hash)?;
+    validate_timeline_name(timeline)?;
+    validate_volume_name(volume_name)?;
+
+    let archive_path = archive_store.join(format!("{content_hash}.{VOLUME_ARCHIVE_EXTENSION}"));
+    if !archive_path.is_file() {
+        return Err(DockerError::CommandFailed(format!(
+            "no stored archive for hash {content_hash}"
+        )));
+    }
+    let actual_hash = hash_file(&archive_path)?;
+    if actual_hash != content_hash {
+        return Err(DockerError::CommandFailed(format!(
+            "archive {content_hash} is corrupt: its contents hash to {actual_hash}"
+        )));
+    }
+    if volume_exists(volume_name) {
+        return Err(DockerError::AlreadyExists(volume_name.to_string()));
+    }
+
+    let managed_label = format!("{LABEL_MANAGED}=true");
+    let timeline_label = format!("{LABEL_TIMELINE}={timeline}");
+    run_docker([
+        "volume",
+        "create",
+        "--label",
+        managed_label.as_str(),
+        "--label",
+        timeline_label.as_str(),
+        volume_name,
+    ])?;
+
+    let unpacked = volume_mountpoint(volume_name)
+        .and_then(|mountpoint| extract_archive_into(&mountpoint, &archive_path));
+    if let Err(error) = unpacked {
+        let _ = run_docker(["volume", "rm", volume_name]);
+        return Err(error);
+    }
+    Ok(RestoredVolume {
+        volume_name: volume_name.to_string(),
+        timeline: timeline.to_string(),
+        content_hash: content_hash.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,5 +602,32 @@ mod tests {
         for valid in ["probe-data", "Data_1", "db.v2"] {
             assert!(validate_volume_name(valid).is_ok(), "should accept: {valid:?}");
         }
+    }
+
+    #[test]
+    fn validates_content_hashes() {
+        let valid = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(validate_content_hash(valid).is_ok());
+        let uppercase = valid.to_uppercase();
+        let not_hex = "g".repeat(64);
+        let path_trick = "../".repeat(21) + "x";
+        for invalid in ["", "abc", uppercase.as_str(), not_hex.as_str(), path_trick.as_str()] {
+            assert!(
+                validate_content_hash(invalid).is_err(),
+                "should reject: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hashes_a_file_with_sha256() {
+        let path = std::env::temp_dir().join(format!("temporaltrail-hash-test-{}", std::process::id()));
+        fs::write(&path, b"abc").unwrap();
+        let hash = hash_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }
