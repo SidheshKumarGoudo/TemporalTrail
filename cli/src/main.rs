@@ -184,6 +184,27 @@ fn run(args: &[String]) -> Result<()> {
                 _ => return Err(usage()),
             }
         }
+        
+        "docker" => {
+            let usage = || tt_engine::EngineError("usage: tl docker list [timeline]".into());
+            match args.get(1).map(|arg| arg.as_str()) {
+                Some("list") => {
+                    let timeline = args.get(2).map(|arg| arg.as_str());
+                    let containers = tt_engine::docker::list_managed_containers(timeline)
+                        .map_err(|error| tt_engine::EngineError(error.to_string()))?;
+                    if containers.is_empty() {
+                        println!("no TemporalTrail-managed containers found");
+                    }
+                    for container in containers {
+                        println!(
+                            "{}  {}  {}  {}  timeline={}",
+                            container.id, container.name, container.image, container.state, container.timeline
+                        );
+                    }
+                }
+                _ => return Err(usage()),
+            }
+        }
 
         "promote" => {
             let node_ref = args.get(1).ok_or_else(|| tt_engine::EngineError(

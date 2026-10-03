@@ -12,6 +12,7 @@
 //! and discard never touches Node history (§13).
 
 pub mod gateway;
+pub mod docker;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::fmt;
