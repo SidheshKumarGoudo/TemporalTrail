@@ -684,6 +684,11 @@ impl Engine {
             self.unmount(timeline_name)?;
         }
         let _ = fs::remove_dir_all(self.live_dir(timeline_name)); // best-effort
+        
+        // Phase 3: tear down this trial's isolated network (namespace, veth,
+        // firewall tables) so a discarded timeline can never leave an orphaned
+        // network behind. Best-effort and safe when no gateway was ever started.
+        let _ = gateway::down(timeline_name);
 
         // Node history is deliberately NOT deleted — it remains as
         // orphaned, unreachable-by-HEAD lineage in the DAG (§13).
