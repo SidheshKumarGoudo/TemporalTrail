@@ -136,6 +136,43 @@ fn run(args: &[String]) -> Result<()> {
             e.log_external_interaction(&cur, head, target, decision)?;
             println!("{decision} {target} logged on {cur} @ n{head}");
         }
+        
+        "gateway" => {
+            let usage = || tt_engine::EngineError(
+                "usage: tl gateway up <timeline> [ip|cidr ...] | down <timeline> | exec <timeline> -- <cmd...>".into(),
+            );
+            let ge = |e: tt_engine::gateway::GatewayError| tt_engine::EngineError(e.to_string());
+            let sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            let tl = args.get(2).ok_or_else(usage)?;
+            e.get_timeline(tl)?; // must be a real timeline
+            match sub {
+                "up" => {
+                    let mut allow = Vec::new();
+                    for a in &args[3..] {
+                        allow.push(tt_engine::gateway::AllowEntry::parse(a).map_err(ge)?);
+                    }
+                    let p = tt_engine::gateway::up(tl, &allow).map_err(ge)?;
+                    println!("gateway up for {tl}: namespace {} ({} -> {})", p.ns, p.trial_ip, p.host_ip);
+                    println!("allowed destinations: {}", if allow.is_empty() { "none".to_string() } else {
+                        allow.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")
+                    });
+                }
+                "down" => {
+                    tt_engine::gateway::down(tl).map_err(ge)?;
+                    println!("gateway down for {tl}");
+                }
+                "exec" => {
+                    let split = args.iter().position(|a| a == "--").ok_or_else(usage)?;
+                    let cmd_args = &args[split + 1..];
+                    if cmd_args.is_empty() {
+                        return Err(usage());
+                    }
+                    let code = tt_engine::gateway::exec_in(tl, cmd_args).map_err(ge)?;
+                    std::process::exit(code);
+                }
+                _ => return Err(usage()),
+            }
+        }
 
         "promote" => {
             let node_ref = args.get(1).ok_or_else(|| tt_engine::EngineError(

@@ -1,14 +1,17 @@
 //! Gateway: network-layer isolation for trial timelines.
-//! Phase 3, step 1: validated allowlist + nftables ruleset generation.
-//! This module only produces text; it never touches the system.
+//! Phase 3: validated allowlist, nftables ruleset generation, and the runtime
+//! that builds/tears down a trial's isolated network namespace (needs sudo).
 
 use std::fmt;
+use std::io::Write;
 use std::net::Ipv4Addr;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayError {
     BadAddress(String),
     BadName(String),
+    Command(String),
 }
 
 impl fmt::Display for GatewayError {
@@ -16,6 +19,7 @@ impl fmt::Display for GatewayError {
         match self {
             GatewayError::BadAddress(s) => write!(f, "invalid allowlist address: {s}"),
             GatewayError::BadName(s) => write!(f, "invalid name: {s}"),
+            GatewayError::Command(s) => write!(f, "{s}"),
         }
     }
 }
@@ -110,6 +114,149 @@ pub fn render_ruleset(
     Ok(l.join("\n") + "\n")
 }
 
+// ---------------------------------------------------------------------------
+// Runtime: actually creates/destroys the isolated network (needs sudo).
+// ---------------------------------------------------------------------------
+
+/// All the names/addresses for one trial's isolated network.
+/// Derived from the timeline name, so `up` and `down` always agree.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub ns: String,
+    pub host_if: String,
+    pub trial_if: String,
+    pub host_ip: String,
+    pub trial_ip: String,
+    pub subnet: AllowEntry,
+    pub table: String,
+}
+
+fn slot_for(name: &str) -> u32 {
+    // FNV-1a hash -> a slot number 1..=250 (known limitation: two timelines
+    // could collide; `up` then fails safely because the namespace exists).
+    let mut h: u32 = 2166136261;
+    for b in name.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h % 250 + 1
+}
+
+pub fn plan_for(timeline: &str) -> Result<Plan, GatewayError> {
+    check_name(timeline, 32, true)?;
+    if timeline == "main" {
+        return Err(GatewayError::Command(
+            "MAIN is not isolated: it is the one timeline allowed to reach the outside world"
+                .into(),
+        ));
+    }
+    let slot = slot_for(timeline);
+    Ok(Plan {
+        ns: format!("ttns{slot}"),
+        host_if: format!("tth{slot}"),
+        trial_if: format!("ttt{slot}"),
+        host_ip: format!("10.200.{slot}.1"),
+        trial_ip: format!("10.200.{slot}.2"),
+        subnet: AllowEntry::parse(&format!("10.200.{slot}.0/24"))?,
+        table: format!("ttgw{slot}"),
+    })
+}
+
+fn run_sudo(args: &[&str]) -> Result<(), GatewayError> {
+    let out = Command::new("sudo")
+        .args(args)
+        .output()
+        .map_err(|e| GatewayError::Command(format!("could not run sudo: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(GatewayError::Command(format!(
+            "`sudo {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+fn load_ruleset(script: &str) -> Result<(), GatewayError> {
+    let mut child = Command::new("sudo")
+        .args(["nft", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| GatewayError::Command(format!("could not run nft: {e}")))?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .map_err(|e| GatewayError::Command(format!("could not send rules to nft: {e}")))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| GatewayError::Command(format!("nft did not finish: {e}")))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(GatewayError::Command(format!(
+            "nft rejected the ruleset: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
+
+/// Create the namespace, the virtual cable, routing, and the firewall allowlist.
+/// If any step fails, everything built so far is torn down again.
+pub fn up(timeline: &str, allow: &[AllowEntry]) -> Result<Plan, GatewayError> {
+    let p = plan_for(timeline)?;
+    let script = render_ruleset(&p.table, &p.host_if, p.subnet, allow)?;
+    run_sudo(&["ip", "netns", "add", &p.ns])?;
+
+    let host_cidr = format!("{}/24", p.host_ip);
+    let trial_cidr = format!("{}/24", p.trial_ip);
+    let steps = || -> Result<(), GatewayError> {
+        run_sudo(&["ip", "link", "add", &p.host_if, "type", "veth", "peer", "name", &p.trial_if])?;
+        run_sudo(&["ip", "link", "set", &p.trial_if, "netns", &p.ns])?;
+        run_sudo(&["ip", "addr", "add", &host_cidr, "dev", &p.host_if])?;
+        run_sudo(&["ip", "link", "set", &p.host_if, "up"])?;
+        run_sudo(&["ip", "netns", "exec", &p.ns, "ip", "addr", "add", &trial_cidr, "dev", &p.trial_if])?;
+        run_sudo(&["ip", "netns", "exec", &p.ns, "ip", "link", "set", &p.trial_if, "up"])?;
+        run_sudo(&["ip", "netns", "exec", &p.ns, "ip", "link", "set", "lo", "up"])?;
+        run_sudo(&["ip", "netns", "exec", &p.ns, "ip", "route", "add", "default", "via", &p.host_ip])?;
+        run_sudo(&["sysctl", "-w", "net.ipv4.ip_forward=1"])?;
+        load_ruleset(&script)
+    };
+    match steps() {
+        Ok(()) => Ok(p),
+        Err(e) => {
+            let _ = down(timeline);
+            Err(e)
+        }
+    }
+}
+
+/// Remove everything `up` created. Best-effort: missing pieces are ignored.
+pub fn down(timeline: &str) -> Result<(), GatewayError> {
+    let p = plan_for(timeline)?;
+    let nat = format!("{}_nat", p.table);
+    let _ = run_sudo(&["nft", "delete", "table", "inet", &p.table]);
+    let _ = run_sudo(&["nft", "delete", "table", "ip", &nat]);
+    let _ = run_sudo(&["ip", "link", "del", &p.host_if]);
+    let _ = run_sudo(&["ip", "netns", "del", &p.ns]);
+    Ok(())
+}
+
+/// Run a command inside the trial's namespace; returns its exit code.
+pub fn exec_in(timeline: &str, cmd: &[String]) -> Result<i32, GatewayError> {
+    let p = plan_for(timeline)?;
+    let status = Command::new("sudo")
+        .args(["ip", "netns", "exec", &p.ns])
+        .args(cmd)
+        .status()
+        .map_err(|e| GatewayError::Command(format!("could not run command: {e}")))?;
+    Ok(status.code().unwrap_or(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +327,16 @@ mod tests {
         let out = render_ruleset("tt_gw_t1", "tt-h", subnet(), &[]).unwrap();
         assert!(!out.contains("ip daddr"));
         assert!(out.contains("iifname \"tt-h\" drop"));
+    }
+
+    #[test]
+    fn plan_is_stable_and_refuses_main() {
+        let a = plan_for("trial-1").unwrap();
+        let b = plan_for("trial-1").unwrap();
+        assert_eq!(a.ns, b.ns);
+        assert_eq!(a.host_if, b.host_if);
+        assert!(a.host_if.len() <= 15 && a.trial_if.len() <= 15);
+        assert!(plan_for("main").is_err());
+        assert!(plan_for("bad name").is_err());
     }
 }
