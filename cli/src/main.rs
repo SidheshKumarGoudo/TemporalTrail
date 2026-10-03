@@ -186,12 +186,17 @@ fn run(args: &[String]) -> Result<()> {
         }
         
         "docker" => {
-            let usage = || tt_engine::EngineError("usage: tl docker list [timeline]".into());
+            let usage = || tt_engine::EngineError(
+                "usage: tl docker list [timeline] | tl docker capture <container> <tag>".into(),
+            );
+            let docker_error = |error: tt_engine::docker::DockerError| {
+                tt_engine::EngineError(error.to_string())
+            };
             match args.get(1).map(|arg| arg.as_str()) {
                 Some("list") => {
                     let timeline = args.get(2).map(|arg| arg.as_str());
                     let containers = tt_engine::docker::list_managed_containers(timeline)
-                        .map_err(|error| tt_engine::EngineError(error.to_string()))?;
+                        .map_err(docker_error)?;
                     if containers.is_empty() {
                         println!("no TemporalTrail-managed containers found");
                     }
@@ -201,6 +206,18 @@ fn run(args: &[String]) -> Result<()> {
                             container.id, container.name, container.image, container.state, container.timeline
                         );
                     }
+                }
+                Some("capture") => {
+                    let container = args.get(2).ok_or_else(usage)?;
+                    let tag = args.get(3).ok_or_else(usage)?;
+                    let capture = tt_engine::docker::capture_container(container, tag)
+                        .map_err(docker_error)?;
+                    println!(
+                        "captured container {} as image {}",
+                        capture.container_name, capture.image_reference
+                    );
+                    println!("image id: {}", capture.image_id);
+                    println!("configuration saved: {} bytes", capture.inspect_json.len());
                 }
                 _ => return Err(usage()),
             }
