@@ -161,6 +161,17 @@ fn run(args: &[String]) -> Result<()> {
                     tt_engine::gateway::down(tl).map_err(ge)?;
                     println!("gateway down for {tl}");
                 }
+                "denied" => {
+                    let list = tt_engine::gateway::harvest(tl).map_err(ge)?;
+                    if list.is_empty() {
+                        println!("no blocked connection attempts recorded for {tl}");
+                    } else {
+                        println!("blocked connection attempts from {tl}:");
+                        for d in &list {
+                            println!("  DENY {}", d.target());
+                        }
+                    }
+                }
                 "exec" => {
                     let split = args.iter().position(|a| a == "--").ok_or_else(usage)?;
                     let cmd_args = &args[split + 1..];
