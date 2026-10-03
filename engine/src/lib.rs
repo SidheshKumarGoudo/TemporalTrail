@@ -679,12 +679,12 @@ impl Engine {
             }
         }
         let allowed: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM external_interaction WHERE timeline_name = ?1 AND decision = 'ALLOW'",
+            "SELECT COUNT(*) FROM external_interaction WHERE timeline_name = ?1 AND decision = 'ALLOW' AND timestamp >= (SELECT created_at FROM timeline WHERE name = ?1)",
             params![timeline_name],
             |r| r.get(0),
         )?;
         let denied: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM external_interaction WHERE timeline_name = ?1 AND decision = 'DENY'",
+            "SELECT COUNT(*) FROM external_interaction WHERE timeline_name = ?1 AND decision = 'DENY' AND timestamp >= (SELECT created_at FROM timeline WHERE name = ?1)",
             params![timeline_name],
             |r| r.get(0),
         )?;
