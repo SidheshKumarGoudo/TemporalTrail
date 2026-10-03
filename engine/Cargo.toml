@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"

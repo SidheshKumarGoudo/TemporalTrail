@@ -187,7 +187,7 @@ fn run(args: &[String]) -> Result<()> {
         
         "docker" => {
             let usage = || tt_engine::EngineError(
-                "usage: tl docker list [timeline] | tl docker capture <container> <tag>".into(),
+                "usage: tl docker list [timeline] | capture <container> <tag> | capture-volume <volume>".into(),
             );
             let docker_error = |error: tt_engine::docker::DockerError| {
                 tt_engine::EngineError(error.to_string())
@@ -218,6 +218,21 @@ fn run(args: &[String]) -> Result<()> {
                     );
                     println!("image id: {}", capture.image_id);
                     println!("configuration saved: {} bytes", capture.inspect_json.len());
+                }
+                Some("capture-volume") => {
+                    let volume = args.get(2).ok_or_else(usage)?;
+                    let archive_store = home.join("docker-volumes");
+                    let capture = tt_engine::docker::capture_volume(volume, &archive_store)
+                        .map_err(docker_error)?;
+                    println!(
+                        "captured volume {} ({} bytes)",
+                        capture.volume_name, capture.size_bytes
+                    );
+                    println!("content hash: {}", capture.content_hash);
+                    println!("archive: {}", capture.archive_path.display());
+                    if capture.already_stored {
+                        println!("identical archive already stored; nothing new written");
+                    }
                 }
                 _ => return Err(usage()),
             }

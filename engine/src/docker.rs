@@ -1,17 +1,21 @@
-//! Docker state domain: ownership of containers by label, and capture of a
-//! container's state for checkpoints.
+//! Docker state domain: ownership of containers and volumes by label, and
+//! capture of their state for checkpoints.
 //!
 //! This module talks to Docker only through its command-line client, and only
 //! ever acts on resources that carry TemporalTrail's ownership labels, so it
-//! can never touch containers that belong to anyone else.
+//! can never touch containers or volumes that belong to anyone else.
 
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fmt;
-use std::process::Command;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-/// Marks a container as created and owned by TemporalTrail.
+/// Marks a container or volume as created and owned by TemporalTrail.
 pub const LABEL_MANAGED: &str = "temporaltrail.managed";
-/// Records which timeline a managed container belongs to.
+/// Records which timeline a managed container or volume belongs to.
 pub const LABEL_TIMELINE: &str = "temporaltrail.timeline";
 /// Repository prefix for the images that hold captured container layers.
 pub const SNAPSHOT_IMAGE_REPOSITORY_PREFIX: &str = "temporaltrail-snapshot";
@@ -20,6 +24,8 @@ const LISTING_FIELD_SEPARATOR: char = '\t';
 const LISTING_FIELD_COUNT: usize = 5;
 const MAX_TIMELINE_NAME_LENGTH: usize = 32;
 const MAX_RESOURCE_NAME_LENGTH: usize = 64;
+const VOLUME_ARCHIVE_EXTENSION: &str = "tar";
+const ARCHIVE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DockerError {
@@ -33,10 +39,10 @@ impl fmt::Display for DockerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DockerError::InvalidTimelineName(name) => write!(f, "invalid timeline name: {name}"),
-            DockerError::InvalidResourceName(name) => write!(f, "invalid container name or tag: {name}"),
+            DockerError::InvalidResourceName(name) => write!(f, "invalid container, volume or tag name: {name}"),
             DockerError::NotManaged(name) => write!(
                 f,
-                "container '{name}' is not managed by TemporalTrail (it has no {LABEL_MANAGED} label)"
+                "'{name}' is not managed by TemporalTrail (it has no {LABEL_MANAGED} label)"
             ),
             DockerError::CommandFailed(message) => write!(f, "{message}"),
         }
@@ -64,6 +70,18 @@ pub struct ContainerCapture {
     /// Raw `docker inspect` output (a JSON array holding one object), kept as
     /// text so it can be stored exactly as Docker reported it.
     pub inspect_json: String,
+}
+
+/// The result of archiving one managed volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeCapture {
+    pub volume_name: String,
+    /// SHA-256 of the archive in lowercase hex; also the archive's file name.
+    pub content_hash: String,
+    pub archive_path: PathBuf,
+    pub size_bytes: u64,
+    /// True when an identical archive was already in the store, so nothing new was written.
+    pub already_stored: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +118,19 @@ fn validate_container_name(name: &str) -> Result<(), DockerError> {
     }
 }
 
+/// Volume names: letters, digits, '-', '_' and '.', starting with a letter or digit.
+fn validate_volume_name(name: &str) -> Result<(), DockerError> {
+    let mut characters = name.chars();
+    let starts_correctly = characters.next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let rest_is_valid =
+        characters.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if starts_correctly && rest_is_valid && name.len() <= MAX_RESOURCE_NAME_LENGTH {
+        Ok(())
+    } else {
+        Err(DockerError::InvalidResourceName(name.to_string()))
+    }
+}
+
 /// Image tags: letters, digits, '_', '.' and '-', not starting with '.' or '-'.
 fn validate_snapshot_tag(tag: &str) -> Result<(), DockerError> {
     let mut characters = tag.chars();
@@ -118,6 +149,11 @@ fn validate_snapshot_tag(tag: &str) -> Result<(), DockerError> {
 // ---------------------------------------------------------------------------
 // Running Docker
 // ---------------------------------------------------------------------------
+
+/// Builds the error converter for file-system failures, prefixed with what was being attempted.
+fn io_failure(context: &'static str) -> impl Fn(std::io::Error) -> DockerError {
+    move |error| DockerError::CommandFailed(format!("{context}: {error}"))
+}
 
 /// Runs `sudo docker <arguments>` and returns its standard output.
 fn run_docker<I, S>(arguments: I) -> Result<String, DockerError>
@@ -241,6 +277,119 @@ pub fn capture_container(container_name: &str, tag: &str) -> Result<ContainerCap
     })
 }
 
+// ---------------------------------------------------------------------------
+// Capturing a volume
+// ---------------------------------------------------------------------------
+
+fn is_volume_managed(volume_name: &str) -> Result<bool, DockerError> {
+    let format_argument = format!("{{{{index .Labels \"{LABEL_MANAGED}\"}}}}");
+    let label_value = run_docker([
+        "volume",
+        "inspect",
+        "--format",
+        format_argument.as_str(),
+        volume_name,
+    ])?;
+    Ok(label_value.trim() == "true")
+}
+
+fn volume_mountpoint(volume_name: &str) -> Result<String, DockerError> {
+    let mountpoint = run_docker(["volume", "inspect", "--format", "{{.Mountpoint}}", volume_name])?;
+    let mountpoint = mountpoint.trim().to_string();
+    if mountpoint.starts_with('/') {
+        Ok(mountpoint)
+    } else {
+        Err(DockerError::CommandFailed(format!(
+            "volume '{volume_name}' has no usable mountpoint: '{mountpoint}'"
+        )))
+    }
+}
+
+/// Archives a directory with `tar` (entries sorted by name, numeric owners, so
+/// an unchanged directory always produces byte-identical output), writing the
+/// archive to `destination`. Returns the archive's SHA-256 (lowercase hex) and size.
+fn archive_directory(directory: &str, destination: &Path) -> Result<(String, u64), DockerError> {
+    let mut tar_process = Command::new("sudo")
+        .args(["tar", "--sort=name", "--numeric-owner", "-C", directory, "-cf", "-", "."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| DockerError::CommandFailed(format!("could not run tar: {error}")))?;
+    let mut tar_output = tar_process
+        .stdout
+        .take()
+        .ok_or_else(|| DockerError::CommandFailed("could not read tar output".into()))?;
+
+    let mut destination_file =
+        fs::File::create(destination).map_err(io_failure("could not create archive file"))?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes: u64 = 0;
+    let mut buffer = vec![0u8; ARCHIVE_COPY_BUFFER_BYTES];
+    loop {
+        let bytes_read = tar_output
+            .read(&mut buffer)
+            .map_err(io_failure("could not read tar output"))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+        destination_file
+            .write_all(&buffer[..bytes_read])
+            .map_err(io_failure("could not write archive file"))?;
+        size_bytes += bytes_read as u64;
+    }
+
+    let finished = tar_process
+        .wait_with_output()
+        .map_err(|error| DockerError::CommandFailed(format!("tar did not finish: {error}")))?;
+    if !finished.status.success() {
+        return Err(DockerError::CommandFailed(format!(
+            "tar failed: {}",
+            String::from_utf8_lossy(&finished.stderr).trim()
+        )));
+    }
+    Ok((format!("{:x}", hasher.finalize()), size_bytes))
+}
+
+/// Archives a managed volume's contents into `archive_store`, under a file
+/// named by the archive's content hash. Identical content is stored once.
+/// Refuses volumes that TemporalTrail does not own.
+pub fn capture_volume(volume_name: &str, archive_store: &Path) -> Result<VolumeCapture, DockerError> {
+    validate_volume_name(volume_name)?;
+    if !is_volume_managed(volume_name)? {
+        return Err(DockerError::NotManaged(volume_name.to_string()));
+    }
+    let mountpoint = volume_mountpoint(volume_name)?;
+    fs::create_dir_all(archive_store).map_err(io_failure("could not create archive store"))?;
+
+    let incoming_path = archive_store.join(format!(
+        ".incoming-{}.{VOLUME_ARCHIVE_EXTENSION}",
+        std::process::id()
+    ));
+    let (content_hash, size_bytes) = match archive_directory(&mountpoint, &incoming_path) {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_file(&incoming_path);
+            return Err(error);
+        }
+    };
+
+    let archive_path = archive_store.join(format!("{content_hash}.{VOLUME_ARCHIVE_EXTENSION}"));
+    let already_stored = archive_path.exists();
+    if already_stored {
+        let _ = fs::remove_file(&incoming_path);
+    } else {
+        fs::rename(&incoming_path, &archive_path).map_err(io_failure("could not store archive"))?;
+    }
+    Ok(VolumeCapture {
+        volume_name: volume_name.to_string(),
+        content_hash,
+        archive_path,
+        size_bytes,
+        already_stored,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +458,19 @@ mod tests {
                 snapshot_image_reference("web-1", invalid).is_err(),
                 "should reject tag: {invalid:?}"
             );
+        }
+    }
+
+    #[test]
+    fn validates_volume_names() {
+        for invalid in ["", "bad name", "x;y", "-dash", "a/b", ".hidden", &"x".repeat(65)] {
+            assert!(
+                validate_volume_name(invalid).is_err(),
+                "should reject volume name: {invalid:?}"
+            );
+        }
+        for valid in ["probe-data", "Data_1", "db.v2"] {
+            assert!(validate_volume_name(valid).is_ok(), "should accept: {valid:?}");
         }
     }
 }
