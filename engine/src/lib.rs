@@ -783,3 +783,26 @@ CREATE TABLE IF NOT EXISTS repo_meta (
     value TEXT
 );
 "#;
+
+impl Engine {
+    /// Names of every timeline except MAIN, i.e. every timeline that may be discarded.
+    pub fn trial_timeline_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_timelines()?
+            .into_iter()
+            .filter(|timeline| !timeline.is_main)
+            .map(|timeline| timeline.name)
+            .collect())
+    }
+
+    /// Discards every timeline except MAIN and returns one report per timeline.
+    /// Stops at the first failure, so the caller can see exactly what was and
+    /// was not discarded.
+    pub fn discard_all_trial_timelines(&self) -> Result<Vec<DiscardReport>> {
+        let mut reports = Vec::new();
+        for name in self.trial_timeline_names()? {
+            reports.push(self.discard(&name)?);
+        }
+        Ok(reports)
+    }
+}

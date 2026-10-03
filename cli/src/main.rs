@@ -204,14 +204,39 @@ fn run(args: &[String]) -> Result<()> {
         }
 
         "discard" => {
-            let name = args.get(1).ok_or_else(|| tt_engine::EngineError(
-                "usage: tl discard <timeline-name>".into(),
-            ))?;
-            let r = e.discard(name)?;
-            println!("timeline '{}' discarded.", r.timeline_name);
-            println!("internal state: discarded.");
-            println!("external interactions: {} allowed, {} denied", r.allowed, r.denied);
-            println!("these external effects cannot be automatically reverted.");
+            let usage = || tt_engine::EngineError(
+                "usage: tl discard <timeline-name> | tl discard --all [--yes]".into(),
+            );
+            let target = args.get(1).ok_or_else(usage)?;
+            if target.as_str() == "--all" {
+                let trial_names = e.trial_timeline_names()?;
+                if trial_names.is_empty() {
+                    println!("no trial timelines to discard (MAIN is never discarded)");
+                    return Ok(());
+                }
+                println!(
+                    "this will discard {} timeline(s): {}",
+                    trial_names.len(),
+                    trial_names.join(", ")
+                );
+                println!("MAIN is not affected. Node history is kept.");
+                if !args.iter().any(|arg| arg == "--yes") {
+                    print!("type 'yes' to continue: ");
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer).ok();
+                    if answer.trim() != "yes" {
+                        println!("cancelled, nothing was discarded");
+                        return Ok(());
+                    }
+                }
+                for report in e.discard_all_trial_timelines()? {
+                    print_discard_report(&report);
+                }
+            } else {
+                let report = e.discard(target)?;
+                print_discard_report(&report);
+            }
         }
 
         other => {
@@ -238,4 +263,14 @@ fn parse_node_id(s: Option<&String>) -> Result<i64> {
     let s = s.strip_prefix('n').unwrap_or(s);
     s.parse::<i64>()
         .map_err(|_| tt_engine::EngineError(format!("invalid node id: {s}")))
+}
+
+fn print_discard_report(report: &tt_engine::DiscardReport) {
+    println!("timeline '{}' discarded.", report.timeline_name);
+    println!("internal state: discarded.");
+    println!(
+        "external interactions: {} allowed, {} denied",
+        report.allowed, report.denied
+    );
+    println!("these external effects cannot be automatically reverted.");
 }
