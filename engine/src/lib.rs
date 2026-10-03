@@ -663,6 +663,21 @@ impl Engine {
         if tl.is_main {
             return Err(err("cannot discard MAIN"));
         }
+        
+        // Phase 3: before the gateway is torn down, copy every blocked
+        // connection attempt the firewall recorded into the external
+        // interaction log, so the counts below (and promotion reports) are real.
+        // Best-effort: if the gateway was never started this finds nothing.
+        if let Ok(blocked) = gateway::harvest(timeline_name) {
+            for d in blocked {
+                let _ = self.log_external_interaction(
+                    timeline_name,
+                    tl.head_node_id,
+                    &d.target(),
+                    "DENY",
+                );
+            }
+        }
         let allowed: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM external_interaction WHERE timeline_name = ?1 AND decision = 'ALLOW'",
             params![timeline_name],
